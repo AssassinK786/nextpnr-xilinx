@@ -909,6 +909,63 @@ bool Arch::place()
     return true;
 }
 
+// Per-sink uphill BFS to the const backbone, BOUNDED and terminating at ANY
+// PSEUDO_VCC/GND-intent wire (the tile's local row/global pseudo wire, a few
+// hops above VCC_WIRE/GND_WIRE) instead of traversing the whole pseudo
+// network to the single bound source -- no O(device) stall.  On success,
+// binds the real sink-side bridge pips (so fasm.cc emits them) and returns
+// true.  Shared by routeVcc() (per-net-user sinks) and
+// routeBufhcePassthroughCE() (a synthetic sink with no netlist user at all).
+// iters_out, if given, receives the number of BFS iterations actually used
+// (success or failure) so callers can track a "worst case" figure.
+bool Arch::bridgeConstToWire(NetInfo *net, int pseudo_intent, WireId sink, int iter_max, int *iters_out)
+{
+    std::queue<WireId> visit;
+    std::unordered_map<WireId, PipId> backtrace;
+    WireId dest = WireId();
+    visit.push(sink);
+    int iter = 0;
+    while (!visit.empty() && iter < iter_max) {
+        ++iter;
+        WireId curr = visit.front();
+        visit.pop();
+        if (getBoundWireNet(curr) == net || wireIntent(curr) == pseudo_intent) {
+            dest = curr;
+            break;
+        }
+        // Don't route the const net THROUGH a wire owned by a signal net
+        // (e.g. the frozen macro's locked routing) -- the old code only
+        // vetted src wires, so a signal-owned dst wire slipped into the
+        // path and tripped bindWire's wire-ownership assert.
+        if (getBoundWireNet(curr) != nullptr)
+            continue;
+        for (auto uh : getPipsUphill(curr)) {
+            if (!checkPipAvail(uh))
+                continue;
+            WireId s = getPipSrcWire(uh);
+            if (backtrace.count(s))
+                continue;
+            if (!checkWireAvail(s) && getBoundWireNet(s) != net)
+                continue;
+            backtrace[s] = uh;
+            visit.push(s);
+        }
+    }
+    if (iters_out != nullptr)
+        *iters_out = iter;
+    if (dest == WireId())
+        return false;
+    while (backtrace.count(dest)) {
+        auto uh = backtrace[dest];
+        dest = getPipDstWire(uh);
+        if (getBoundWireNet(dest) == nullptr)
+            bindWire(dest, net, STRENGTH_STRONG);
+        if (getBoundPipNet(uh) == nullptr)
+            bindPip(uh, net, STRENGTH_STRONG);
+    }
+    return true;
+}
+
 std::vector<Arch::ConstHoldout> Arch::routeVcc()
 {
     std::vector<ConstHoldout> holdouts;
@@ -916,11 +973,7 @@ std::vector<Arch::ConstHoldout> Arch::routeVcc()
     // pips before the main router, so fasm.cc emits the const distribution and
     // silicon actually gets the constants.  (Originally Vcc-only + router1-only;
     // Gnd was left to defaults, which floated address-path const-0 inputs high
-    // -> corrupt PC = 0x..fff0.)  Per-sink uphill BFS to the const backbone,
-    // BOUNDED and terminating at ANY PSEUDO_VCC/GND-intent wire (the tile's
-    // local row/global pseudo wire, a few hops above VCC_WIRE/GND_WIRE) instead
-    // of traversing the whole pseudo network to the single bound source -> no
-    // O(device) stall.  Real sink-side bridge pips get bound + emitted to FASM.
+    // -> corrupt PC = 0x..fff0.)  See bridgeConstToWire() for the per-sink BFS.
     const int iter_max = 50000;
     std::vector<std::pair<IdString, int>> cnets = {
         { id("$PACKER_VCC_NET"), ID_PSEUDO_VCC },
@@ -943,57 +996,21 @@ std::vector<Arch::ConstHoldout> Arch::routeVcc()
         int unrouted = 0, max_iter_seen = 0;
         std::vector<ConstHoldout> net_holdouts;
         for (auto &usr : net->users) {
-            std::queue<WireId> visit;
-            std::unordered_map<WireId, PipId> backtrace;
-            WireId dest = WireId();
             WireId sink = getCtx()->getNetinfoSinkWire(net, usr);
             if (sink == WireId())
                 log_error("Pin '%s' of bel '%s' has no associated wire\n", usr.port.c_str(this), nameOfBel(usr.cell->bel));
-            visit.push(sink);
-            int iter = 0;
-            while (!visit.empty() && iter < iter_max) {
-                ++iter;
-                WireId curr = visit.front();
-                visit.pop();
-                if (getBoundWireNet(curr) == net || wireIntent(curr) == pseudo_intent) {
-                    dest = curr;
-                    break;
-                }
-                // Don't route the const net THROUGH a wire owned by a signal net
-                // (e.g. the frozen macro's locked routing) -- the old code only
-                // vetted src wires, so a signal-owned dst wire slipped into the
-                // path and tripped bindWire's wire-ownership assert.
-                if (getBoundWireNet(curr) != nullptr)
-                    continue;
-                for (auto uh : getPipsUphill(curr)) {
-                    if (!checkPipAvail(uh))
-                        continue;
-                    WireId s = getPipSrcWire(uh);
-                    if (backtrace.count(s))
-                        continue;
-                    if (!checkWireAvail(s) && getBoundWireNet(s) != net)
-                        continue;
-                    backtrace[s] = uh;
-                    visit.push(s);
-                }
-            }
-            if (iter > max_iter_seen)
-                max_iter_seen = iter;
-            if (dest == WireId()) {
+            int iter_used = 0;
+            if (!bridgeConstToWire(net, pseudo_intent, sink, iter_max, &iter_used)) {
                 ++unrouted;
+                if (iter_used > max_iter_seen)
+                    max_iter_seen = iter_used;
                 log_info("    %s HOLDOUT: %s.%s (bel %s, wire %s)\n", cn.first.c_str(this), usr.cell->name.c_str(this),
                          usr.port.c_str(this), nameOfBel(usr.cell->bel), nameOfWire(sink));
                 net_holdouts.push_back(ConstHoldout{net, usr.cell, usr.port, pseudo_intent == ID_PSEUDO_VCC});
                 continue;
             }
-            while (backtrace.count(dest)) {
-                auto uh = backtrace[dest];
-                dest = getPipDstWire(uh);
-                if (getBoundWireNet(dest) == nullptr)
-                    bindWire(dest, net, STRENGTH_STRONG);
-                if (getBoundPipNet(uh) == nullptr)
-                    bindPip(uh, net, STRENGTH_STRONG);
-            }
+            if (iter_used > max_iter_seen)
+                max_iter_seen = iter_used;
         }
         // Users sharing a site wire (SLICEM WA1..6 and A1..6) are reached once
         // the per-user BFS binds that wire for any of them.
@@ -1018,6 +1035,70 @@ std::vector<Arch::ConstHoldout> Arch::routeVcc()
                  int(net->users.size()) - unrouted, int(net->users.size()), unrouted, max_iter_seen);
     }
     return holdouts;
+}
+
+// A BUFHCE used as a pure route-thru pass-through (fasm.cc's CLK_HROW pp_config
+// table, no cell ever placed on the site) has its CE pin left completely
+// unrouted -- fasm.cc unconditionally emits ZINV_CE for this path with no
+// corresponding net, unlike a packed BUFHCE_BUFHCE cell (pack_clocking_xc7.cc's
+// tie_port()) which always ties CE to a real routed constant.  On real silicon
+// a floating, inverted CE reads as permanently disabled, freezing every
+// downstream flop fed by this leaf tap (nextpnr-xilinx#177).  Find every used
+// instance of this pass-through pip after the main router has committed to it,
+// and bridge $PACKER_GND_NET to its CE pin exactly like a packed cell would
+// get, using the same bridge BFS as routeVcc().
+void Arch::routeBufhcePassthroughCE()
+{
+    if (!nets.count(id("$PACKER_GND_NET")))
+        return;
+    NetInfo *gnd = nets.at(id("$PACKER_GND_NET")).get();
+    int tied = 0, missed = 0;
+    for (auto &ni : nets) {
+        NetInfo *net = ni.second.get();
+        for (auto &w : net->wires) {
+            PipId pip = w.second.pip;
+            if (pip == PipId())
+                continue;
+            auto &pd = locInfo(pip).pip_data[pip.index];
+            if (pd.flags != PIP_TILE_ROUTING)
+                continue;
+            IdString src = IdString(locInfo(pip).wire_data[pd.src_index].name);
+            IdString dst = IdString(locInfo(pip).wire_data[pd.dst_index].name);
+            std::string dst_s = dst.str(this), src_s = src.str(this);
+            const std::string dst_pfx = "CLK_HROW_CK_HCLK_OUT_", src_pfx = "CLK_HROW_CK_MUX_OUT_";
+            if (dst_s.compare(0, dst_pfx.size(), dst_pfx) != 0)
+                continue;
+            if (src_s.compare(0, src_pfx.size(), src_pfx) != 0)
+                continue;
+            std::string hck = dst_s.substr(dst_pfx.size());
+            if (hck != src_s.substr(src_pfx.size()))
+                continue;
+            std::string tile_name = chip_info->tile_insts[pip.tile].name.get();
+            std::string ce_wire_name = tile_name + "/CLK_HROW_BUFHCE_CE_" + hck;
+            WireId ce_wire = getWireByName(id(ce_wire_name));
+            if (ce_wire == WireId()) {
+                log_warning("    BUFHCE pass-through at %s: no CE wire '%s' found, CE left unrouted\n",
+                            tile_name.c_str(), ce_wire_name.c_str());
+                ++missed;
+                continue;
+            }
+            if (getBoundWireNet(ce_wire) != nullptr) {
+                // Already driven (e.g. a packed BUFHCE_BUFHCE on an adjacent
+                // lane at this same tile already tied it) -- nothing to do.
+                ++tied;
+                continue;
+            }
+            if (bridgeConstToWire(gnd, ID_PSEUDO_GND, ce_wire, 50000)) {
+                ++tied;
+            } else {
+                log_warning("    BUFHCE pass-through at %s: could not bridge GND to CE ('%s')\n",
+                            tile_name.c_str(), ce_wire_name.c_str());
+                ++missed;
+            }
+        }
+    }
+    if (tied > 0 || missed > 0)
+        log_info("    BUFHCE pass-through CE: %d tied to GND, %d could not be reached\n", tied, missed);
 }
 
 // BODGE: template a GT-clock -> BUFG route from the known-good Vivado path.
@@ -2174,6 +2255,11 @@ bool Arch::route()
     // exited 255; as a post-router fill it only consumes leftover resources.
     // routeConstants() drives what the fill misses from local LUTs and re-routes.
     routeConstants(run_router);
+    // BUFHCE pass-through CE bridging is its own BFS fill, same shape as
+    // routeVcc()'s but for a synthetic sink with no netlist user -- run it
+    // after routeConstants() has settled so it only consumes leftover
+    // resources, same reasoning as the routeVcc() comment above.
+    routeBufhcePassthroughCE();
     fixupRouting();
     // router1 runs its own final timing analysis; the router2 flow
     // historically ended without one, so the last "Max frequency" lines the

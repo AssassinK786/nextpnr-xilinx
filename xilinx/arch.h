@@ -1678,6 +1678,8 @@ struct Arch : BaseCtx
     int insertConstDrivers(const std::vector<ConstHoldout> &holdouts, std::vector<ConstHoldout> &unplaced);
     void ripupConstNets();
     void routeClock();
+    void routeBufhcePassthroughCE();
+    bool bridgeConstToWire(NetInfo *net, int pseudo_intent, WireId sink, int iter_max, int *iters_out = nullptr);
     void applyFixedRoutes(const std::string &filename);
     void writeFixedRoutes(const std::string &filename) const;
     bool gtClockTemplateRoute(NetInfo *clk_net, PortRef &usr);

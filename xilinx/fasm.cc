@@ -306,7 +306,21 @@ struct FasmBackend
                     pp_config[{ ctx->id("CLK_HROW_" + s1 + "_R"),
                                 ctx->id("CLK_HROW_CK_HCLK_OUT_" + hck), ctx->id("CLK_HROW_CK_MUX_OUT_" + hck) }] = {
                                     "BUFHCE.BUFHCE_" + buf + ".IN_USE",
-                                    "BUFHCE.BUFHCE_" + buf + ".ZINV_CE"
+                                    // ZINV_CE deliberately NOT set here: Arch::routeBufhcePassthroughCE()
+                                    // now ties this BUFHCE's CE to a real routed GND net, matching
+                                    // Vivado's own reference for a genuinely tied CE (IS_CE_INVERTED=0,
+                                    // CE=GND) -- unconditionally inverting on top of that (as this table
+                                    // used to, unconditionally, when CE had no routed net at all) would
+                                    // double-invert relative to that reference (nextpnr-xilinx#177).
+                                    //
+                                    // CE_TYPE.ASYNC and INIT_OUT: there is no cell here to carry these as
+                                    // params (unlike a packed BUFHCE_BUFHCE, whose own CE_TYPE/INIT_OUT
+                                    // params get read out at the ci->type == id_BUFHCE_BUFHCE branch) --
+                                    // this table only ever emitted IN_USE before, leaving both at their
+                                    // unset/default value.  Match Vivado's own reference for this exact
+                                    // pass-through resource, which has both set.
+                                    "BUFHCE.BUFHCE_" + buf + ".CE_TYPE.ASYNC",
+                                    "BUFHCE.BUFHCE_" + buf + ".INIT_OUT"
                                 };
                 }
             }
