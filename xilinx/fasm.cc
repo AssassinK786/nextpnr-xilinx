@@ -313,15 +313,14 @@ struct FasmBackend
                                     // used to, unconditionally, when CE had no routed net at all) would
                                     // double-invert relative to that reference (nextpnr-xilinx#177).
                                     //
-                                    // CE_TYPE.ASYNC and INIT_OUT: there is no cell here to carry these as
-                                    // params (unlike a packed BUFHCE_BUFHCE, whose own CE_TYPE/INIT_OUT
-                                    // params get read out at the ci->type == id_BUFHCE_BUFHCE branch) --
-                                    // this table only ever emitted IN_USE before, leaving both at their
-                                    // unset/default value.  Match Vivado's own reference for this exact
-                                    // pass-through resource, which has both set.
-                                    "BUFHCE.BUFHCE_" + buf + ".CE_TYPE.ASYNC",
-                                    "BUFHCE.BUFHCE_" + buf + ".INIT_OUT"
-                                };
+                                    // CE_TYPE.ASYNC and INIT_OUT deliberately NOT set here either: a
+                                    // hardware A/B campaign against five real Vivado golden references
+                                    // for this exact pass-through resource (MMCM->BUFG/BUFH/BUFHCE,
+                                    // nextpnr-xilinx#177) found Vivado never sets either bit -- not even
+                                    // when the source netlist explicitly carries CE_TYPE("SYNC")/
+                                    // INIT_OUT(0) params -- so emitting them here (as this table used to)
+                                    // doesn't match Vivado's actual behavior for a route-thru pass-through.
+                                    };
                 }
             }
 
