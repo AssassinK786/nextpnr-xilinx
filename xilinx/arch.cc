@@ -1000,7 +1000,8 @@ std::vector<Arch::ConstHoldout> Arch::routeVcc()
             if (sink == WireId())
                 log_error("Pin '%s' of bel '%s' has no associated wire\n", usr.port.c_str(this), nameOfBel(usr.cell->bel));
             int iter_used = 0;
-            if (!bridgeConstToWire(net, pseudo_intent, sink, iter_max, &iter_used)) {
+            bool bridged = bridgeConstToWire(net, pseudo_intent, sink, iter_max, &iter_used);
+            if (!bridged) {
                 ++unrouted;
                 if (iter_used > max_iter_seen)
                     max_iter_seen = iter_used;
@@ -1057,38 +1058,46 @@ void Arch::routeBufhcePassthroughCE()
         NetInfo *net = ni.second.get();
         for (auto &w : net->wires) {
             PipId pip = w.second.pip;
-            if (pip == PipId())
+            bool pip_is_unbound = (pip == PipId());
+            if (pip_is_unbound)
                 continue;
             auto &pd = locInfo(pip).pip_data[pip.index];
-            if (pd.flags != PIP_TILE_ROUTING)
+            bool is_ordinary_routing_pip = (pd.flags == PIP_TILE_ROUTING);
+            if (!is_ordinary_routing_pip)
                 continue;
             IdString src = IdString(locInfo(pip).wire_data[pd.src_index].name);
             IdString dst = IdString(locInfo(pip).wire_data[pd.dst_index].name);
             std::string dst_s = dst.str(this), src_s = src.str(this);
             const std::string dst_pfx = "CLK_HROW_CK_HCLK_OUT_", src_pfx = "CLK_HROW_CK_MUX_OUT_";
-            if (dst_s.compare(0, dst_pfx.size(), dst_pfx) != 0)
+            bool dst_matches_passthrough_out = (dst_s.compare(0, dst_pfx.size(), dst_pfx) == 0);
+            if (!dst_matches_passthrough_out)
                 continue;
-            if (src_s.compare(0, src_pfx.size(), src_pfx) != 0)
+            bool src_matches_passthrough_in = (src_s.compare(0, src_pfx.size(), src_pfx) == 0);
+            if (!src_matches_passthrough_in)
                 continue;
             std::string hck = dst_s.substr(dst_pfx.size());
-            if (hck != src_s.substr(src_pfx.size()))
+            bool hck_indices_match = (hck == src_s.substr(src_pfx.size()));
+            if (!hck_indices_match)
                 continue;
             std::string tile_name = chip_info->tile_insts[pip.tile].name.get();
             std::string ce_wire_name = tile_name + "/CLK_HROW_BUFHCE_CE_" + hck;
             WireId ce_wire = getWireByName(id(ce_wire_name));
-            if (ce_wire == WireId()) {
+            bool ce_wire_found = (ce_wire != WireId());
+            if (!ce_wire_found) {
                 log_warning("    BUFHCE pass-through at %s: no CE wire '%s' found, CE left unrouted\n",
                             tile_name.c_str(), ce_wire_name.c_str());
                 ++missed;
                 continue;
             }
-            if (getBoundWireNet(ce_wire) != nullptr) {
+            bool ce_wire_already_driven = (getBoundWireNet(ce_wire) != nullptr);
+            if (ce_wire_already_driven) {
                 // Already driven (e.g. a packed BUFHCE_BUFHCE on an adjacent
                 // lane at this same tile already tied it) -- nothing to do.
                 ++tied;
                 continue;
             }
-            if (bridgeConstToWire(gnd, ID_PSEUDO_GND, ce_wire, 50000)) {
+            bool bridged = bridgeConstToWire(gnd, ID_PSEUDO_GND, ce_wire, 50000);
+            if (bridged) {
                 ++tied;
             } else {
                 log_warning("    BUFHCE pass-through at %s: could not bridge GND to CE ('%s')\n",
