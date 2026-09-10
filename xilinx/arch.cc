@@ -1040,20 +1040,42 @@ std::vector<Arch::ConstHoldout> Arch::routeVcc()
 
 // A BUFHCE used as a pure route-thru pass-through (fasm.cc's CLK_HROW pp_config
 // table, no cell ever placed on the site) has its CE pin left completely
-// unrouted -- fasm.cc unconditionally emits ZINV_CE for this path with no
-// corresponding net, unlike a packed BUFHCE_BUFHCE cell (pack_clocking_xc7.cc's
-// tie_port()) which always ties CE to a real routed constant.  On real silicon
-// a floating, inverted CE reads as permanently disabled, freezing every
-// downstream flop fed by this leaf tap (nextpnr-xilinx#177).  Find every used
-// instance of this pass-through pip after the main router has committed to it,
-// and bridge $PACKER_GND_NET to its CE pin exactly like a packed cell would
-// get, using the same bridge BFS as routeVcc().
+// unrouted -- no bits get set anywhere on its path at all.  That is NOT the
+// same as floating on real silicon, though: every INT tile's IMUX inputs
+// (artix7 and spartan7 alike) are documented as defaulting to VCC_WIRE
+// (ppips_int_r.db: "INT_R.IMUX0.VCC_WIRE default"), and the two hops from
+// there into CLK_HROW_BUFHCE_CE_<hck> are unconditional ("always") pips with
+// no bits of their own -- so with nothing configured, this CE pin already
+// reads as a hard 1.  That is exactly what all five Vivado golden references
+// for this resource show for a pass-through with CE tied off (nextpnr-xilinx
+// #177): IN_USE and ZINV_CE (uninverted) set, and zero interconnect bits
+// spent getting there.
+//
+// So the fix here is not "route a constant that was floating" -- it's
+// "stop relying on an implicit default and make the same VCC tie explicit",
+// exactly like a packed BUFHCE_BUFHCE cell gets via pack_clocking_xc7.cc's
+// tie_port(ci, "CE", true, true).  Bridging to the VCC pseudo-net (not GND)
+// keeps the resulting configuration identical to what was already being
+// emitted -- since VCC_WIRE is the database default, every pip this bridge
+// binds is itself bitless, so the bitstream does not move (measured
+// byte-identical, 1-tap and 10-tap designs, both against nextpnr's own
+// pre-existing output and against Vivado's references).  This also fixes a
+// real safety gap: if the bridge ever fails to reach the constant network,
+// the buffer now defaults to the same disabled-only-if-floating state it
+// always had, rather than (as an earlier GND-tie revision of this fix did)
+// silently landing on a disabled buffer with just a console warning.
+//
+// Find every used instance of this pass-through pip after the main router
+// (and fixupRouting()) has committed to it, and bridge $PACKER_VCC_NET to its
+// CE pin, using the same bridge BFS as routeVcc().  The pip-recognition logic
+// (matchBufhcePassthroughPip(), arch.h) is shared with fasm.cc's pp_config
+// table registration for this same pip, so the two cannot drift apart.
 void Arch::routeBufhcePassthroughCE()
 {
-    if (!nets.count(id("$PACKER_GND_NET")))
+    if (!nets.count(id("$PACKER_VCC_NET")))
         return;
-    NetInfo *gnd = nets.at(id("$PACKER_GND_NET")).get();
-    int tied = 0, missed = 0;
+    NetInfo *vcc = nets.at(id("$PACKER_VCC_NET")).get();
+    int tied = 0, already_driven = 0, missed = 0;
     for (auto &ni : nets) {
         NetInfo *net = ni.second.get();
         for (auto &w : net->wires) {
@@ -1067,17 +1089,9 @@ void Arch::routeBufhcePassthroughCE()
                 continue;
             IdString src = IdString(locInfo(pip).wire_data[pd.src_index].name);
             IdString dst = IdString(locInfo(pip).wire_data[pd.dst_index].name);
-            std::string dst_s = dst.str(this), src_s = src.str(this);
-            const std::string dst_pfx = "CLK_HROW_CK_HCLK_OUT_", src_pfx = "CLK_HROW_CK_MUX_OUT_";
-            bool dst_matches_passthrough_out = (dst_s.compare(0, dst_pfx.size(), dst_pfx) == 0);
-            if (!dst_matches_passthrough_out)
-                continue;
-            bool src_matches_passthrough_in = (src_s.compare(0, src_pfx.size(), src_pfx) == 0);
-            if (!src_matches_passthrough_in)
-                continue;
-            std::string hck = dst_s.substr(dst_pfx.size());
-            bool hck_indices_match = (hck == src_s.substr(src_pfx.size()));
-            if (!hck_indices_match)
+            std::string hck;
+            bool is_bufhce_passthrough = matchBufhcePassthroughPip(dst.str(this), src.str(this), hck);
+            if (!is_bufhce_passthrough)
                 continue;
             std::string tile_name = chip_info->tile_insts[pip.tile].name.get();
             std::string ce_wire_name = tile_name + "/CLK_HROW_BUFHCE_CE_" + hck;
@@ -1092,22 +1106,24 @@ void Arch::routeBufhcePassthroughCE()
             bool ce_wire_already_driven = (getBoundWireNet(ce_wire) != nullptr);
             if (ce_wire_already_driven) {
                 // Already driven (e.g. a packed BUFHCE_BUFHCE on an adjacent
-                // lane at this same tile already tied it) -- nothing to do.
-                ++tied;
+                // lane at this same tile already tied it) -- nothing to do,
+                // and nothing this pass itself tied, so don't count it as such.
+                ++already_driven;
                 continue;
             }
-            bool bridged = bridgeConstToWire(gnd, ID_PSEUDO_GND, ce_wire, 50000);
+            bool bridged = bridgeConstToWire(vcc, ID_PSEUDO_VCC, ce_wire, 50000);
             if (bridged) {
                 ++tied;
             } else {
-                log_warning("    BUFHCE pass-through at %s: could not bridge GND to CE ('%s')\n",
+                log_warning("    BUFHCE pass-through at %s: could not bridge VCC to CE ('%s')\n",
                             tile_name.c_str(), ce_wire_name.c_str());
                 ++missed;
             }
         }
     }
-    if (tied > 0 || missed > 0)
-        log_info("    BUFHCE pass-through CE: %d tied to GND, %d could not be reached\n", tied, missed);
+    if (tied > 0 || already_driven > 0 || missed > 0)
+        log_info("    BUFHCE pass-through CE: %d tied to VCC, %d already driven, %d could not be reached\n", tied,
+                  already_driven, missed);
 }
 
 // BODGE: template a GT-clock -> BUFG route from the known-good Vivado path.
@@ -2264,12 +2280,10 @@ bool Arch::route()
     // exited 255; as a post-router fill it only consumes leftover resources.
     // routeConstants() drives what the fill misses from local LUTs and re-routes.
     routeConstants(run_router);
-    // BUFHCE pass-through CE bridging is its own BFS fill, same shape as
-    // routeVcc()'s but for a synthetic sink with no netlist user -- run it
-    // after routeConstants() has settled so it only consumes leftover
-    // resources, same reasoning as the routeVcc() comment above.
-    routeBufhcePassthroughCE();
     fixupRouting();
+    // Runs after fixupRouting() so a pass-through pip fixupRouting() decides to
+    // un-pip doesn't get its CE needlessly tied to VCC on an unused BUFHCE.
+    routeBufhcePassthroughCE();
     // router1 runs its own final timing analysis; the router2 flow
     // historically ended without one, so the last "Max frequency" lines the
     // user saw were the placer's pre-route ESTIMATES (printed mid-flow by
