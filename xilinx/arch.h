@@ -25,6 +25,7 @@
 
 #include <boost/iostreams/device/mapped_file.hpp>
 
+#include <functional>
 #include <iostream>
 
 NEXTPNR_NAMESPACE_BEGIN
@@ -1663,7 +1664,19 @@ struct Arch : BaseCtx
     void fixupPlacement();
     void fixupRouting();
 
-    void routeVcc();
+    // A constant-net sink the backbone fill pass (routeVcc) could not reach.
+    struct ConstHoldout
+    {
+        NetInfo *net; // $PACKER_GND_NET or $PACKER_VCC_NET
+        CellInfo *cell;
+        IdString port;
+        bool value; // constant the pin requires
+    };
+    std::vector<ConstHoldout> routeVcc();
+    bool allow_const_holdouts = false;
+    void routeConstants(std::function<void()> reroute);
+    int insertConstDrivers(const std::vector<ConstHoldout> &holdouts, std::vector<ConstHoldout> &unplaced);
+    void ripupConstNets();
     void routeClock();
     void applyFixedRoutes(const std::string &filename);
     void writeFixedRoutes(const std::string &filename) const;

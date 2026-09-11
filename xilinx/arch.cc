@@ -909,8 +909,9 @@ bool Arch::place()
     return true;
 }
 
-void Arch::routeVcc()
+std::vector<Arch::ConstHoldout> Arch::routeVcc()
 {
+    std::vector<ConstHoldout> holdouts;
     // Route BOTH constant pseudo-nets (Vcc and Gnd) through their real bridge
     // pips before the main router, so fasm.cc emits the const distribution and
     // silicon actually gets the constants.  (Originally Vcc-only + router1-only;
@@ -925,9 +926,8 @@ void Arch::routeVcc()
         { id("$PACKER_VCC_NET"), ID_PSEUDO_VCC },
         { id("$PACKER_GND_NET"), ID_PSEUDO_GND },
     };
-    // Record GND sinks the backbone fill can't reach, so a second pass can drive
-    // them from a local LUT1(INIT=0) instead (see pack_carry_xc7.cc).  One line
-    // per holdout: "<cell> <port>" (e.g. "mem_addr_reg_13__i_2 DI0").
+    // Unreached sinks are returned to the caller; NEXTPNR_GND_HOLDOUT_FILE also
+    // dumps the GND ones as "<cell> <port>" lines.
     std::ofstream holdout_out;
     if (const char *hf = getenv("NEXTPNR_GND_HOLDOUT_FILE"))
         holdout_out.open(hf);
@@ -941,6 +941,7 @@ void Arch::routeVcc()
         if (src != WireId())
             bindWire(src, net, STRENGTH_STRONG);
         int unrouted = 0, max_iter_seen = 0;
+        std::vector<ConstHoldout> net_holdouts;
         for (auto &usr : net->users) {
             std::queue<WireId> visit;
             std::unordered_map<WireId, PipId> backtrace;
@@ -980,14 +981,9 @@ void Arch::routeVcc()
                 max_iter_seen = iter;
             if (dest == WireId()) {
                 ++unrouted;
-                if (getenv("NEXTPNR_LOG_CONST_HOLDOUTS"))
-                    log_info("    %s HOLDOUT: %s.%s (bel %s)\n", cn.first.c_str(this),
-                             usr.cell->name.c_str(this), usr.port.c_str(this),
-                             nameOfBel(usr.cell->bel));
-                // GND holdouts only: a local LUT1(INIT=0) can replace these.
-                if (holdout_out.is_open() && cn.second == ID_PSEUDO_GND)
-                    holdout_out << usr.cell->name.c_str(this) << " "
-                                << usr.port.c_str(this) << "\n";
+                log_info("    %s HOLDOUT: %s.%s (bel %s, wire %s)\n", cn.first.c_str(this), usr.cell->name.c_str(this),
+                         usr.port.c_str(this), nameOfBel(usr.cell->bel), nameOfWire(sink));
+                net_holdouts.push_back(ConstHoldout{net, usr.cell, usr.port, pseudo_intent == ID_PSEUDO_VCC});
                 continue;
             }
             while (backtrace.count(dest)) {
@@ -999,10 +995,29 @@ void Arch::routeVcc()
                     bindPip(uh, net, STRENGTH_STRONG);
             }
         }
-        log_info("    %s: %d/%d sinks bridged (%d left to main router; max BFS %d)\n",
-                 cn.first.c_str(this), int(net->users.size()) - unrouted, int(net->users.size()),
-                 unrouted, max_iter_seen);
+        // Users sharing a site wire (SLICEM WA1..6 and A1..6) are reached once
+        // the per-user BFS binds that wire for any of them.
+        for (auto &h : net_holdouts) {
+            PortRef pr;
+            pr.cell = h.cell;
+            pr.port = h.port;
+            WireId sink = getCtx()->getNetinfoSinkWire(net, pr);
+            const bool wire_bound_for_later_user = getBoundWireNet(sink) == net;
+            if (wire_bound_for_later_user) {
+                --unrouted;
+                log_info("    %s HOLDOUT %s.%s reached after all: wire %s bound for a later user\n",
+                         cn.first.c_str(this), h.cell->name.c_str(this), h.port.c_str(this), nameOfWire(sink));
+                continue;
+            }
+            holdouts.push_back(h);
+            const bool dump_gnd_holdout = holdout_out.is_open() && cn.second == ID_PSEUDO_GND;
+            if (dump_gnd_holdout)
+                holdout_out << h.cell->name.c_str(this) << " " << h.port.c_str(this) << "\n";
+        }
+        log_info("    %s: %d/%d sinks bridged (%d holdouts; max BFS %d)\n", cn.first.c_str(this),
+                 int(net->users.size()) - unrouted, int(net->users.size()), unrouted, max_iter_seen);
     }
+    return holdouts;
 }
 
 // BODGE: template a GT-clock -> BUFG route from the known-good Vivado path.
@@ -2134,27 +2149,31 @@ bool Arch::route()
     }
     findSourceSinkLocations();
 
-    bool result;
-    if (router == "router1") {
-        result = router1(getCtx(), Router1Cfg(getCtx()));
-    } else if (router == "router2") {
-        auto cfg = Router2Cfg(getCtx());
-        cfg.bb_margin_x = 4;
-        cfg.bb_margin_y = 4;
-        cfg.backwards_max_iter = 200;
-        cfg.perf_profile = true;
-        router2(getCtx(), cfg);
-        result = true;
-    } else {
-        log_error("Xilinx architecture does not support router '%s'\n", router.c_str());
-    }
+    bool result = true;
+    auto run_router = [&]() {
+        if (router == "router1") {
+            result = router1(getCtx(), Router1Cfg(getCtx()));
+        } else if (router == "router2") {
+            auto cfg = Router2Cfg(getCtx());
+            cfg.bb_margin_x = 4;
+            cfg.bb_margin_y = 4;
+            cfg.backwards_max_iter = 200;
+            cfg.perf_profile = true;
+            router2(getCtx(), cfg);
+            result = true;
+        } else {
+            log_error("Xilinx architecture does not support router '%s'\n", router.c_str());
+        }
+    };
+    run_router();
     // routeVcc as a FILL pass: run AFTER the main router so signal nets claim
     // their wires first, then bridge the constant (pwr/gnd) nets through whatever
     // real pips remain free (the BFS already gates on checkWireAvail/checkPipAvail).
     // Pre-router binding over-constrained routing and made router2 fail to route
     // address-path FF arcs (e.g. mem_addr O5->AFFMUX), so const-routed builds
     // exited 255; as a post-router fill it only consumes leftover resources.
-    routeVcc();
+    // routeConstants() drives what the fill misses from local LUTs and re-routes.
+    routeConstants(run_router);
     fixupRouting();
     // router1 runs its own final timing analysis; the router2 flow
     // historically ended without one, so the last "Max frequency" lines the
