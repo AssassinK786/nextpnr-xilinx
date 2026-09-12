@@ -929,7 +929,8 @@ bool Arch::bridgeConstToWire(NetInfo *net, int pseudo_intent, WireId sink, int i
         ++iter;
         WireId curr = visit.front();
         visit.pop();
-        if (getBoundWireNet(curr) == net || wireIntent(curr) == pseudo_intent) {
+        bool curr_is_dest = (getBoundWireNet(curr) == net) || (wireIntent(curr) == pseudo_intent);
+        if (curr_is_dest) {
             dest = curr;
             break;
         }
@@ -937,15 +938,18 @@ bool Arch::bridgeConstToWire(NetInfo *net, int pseudo_intent, WireId sink, int i
         // (e.g. the frozen macro's locked routing) -- the old code only
         // vetted src wires, so a signal-owned dst wire slipped into the
         // path and tripped bindWire's wire-ownership assert.
-        if (getBoundWireNet(curr) != nullptr)
+        bool curr_owned_by_other_net = (getBoundWireNet(curr) != nullptr);
+        if (curr_owned_by_other_net)
             continue;
         for (auto uh : getPipsUphill(curr)) {
             if (!checkPipAvail(uh))
                 continue;
             WireId s = getPipSrcWire(uh);
-            if (backtrace.count(s))
+            bool src_already_visited = (backtrace.count(s) != 0);
+            if (src_already_visited)
                 continue;
-            if (!checkWireAvail(s) && getBoundWireNet(s) != net)
+            bool src_unusable = !checkWireAvail(s) && (getBoundWireNet(s) != net);
+            if (src_unusable)
                 continue;
             backtrace[s] = uh;
             visit.push(s);
@@ -953,15 +957,20 @@ bool Arch::bridgeConstToWire(NetInfo *net, int pseudo_intent, WireId sink, int i
     }
     if (iters_out != nullptr)
         *iters_out = iter;
-    if (dest == WireId())
+    bool no_path_found = (dest == WireId());
+    if (no_path_found)
         return false;
-    while (backtrace.count(dest)) {
+    bool backtrace_has_more_hops = (backtrace.count(dest) != 0);
+    while (backtrace_has_more_hops) {
         auto uh = backtrace[dest];
         dest = getPipDstWire(uh);
-        if (getBoundWireNet(dest) == nullptr)
+        bool dest_wire_unbound = (getBoundWireNet(dest) == nullptr);
+        if (dest_wire_unbound)
             bindWire(dest, net, STRENGTH_STRONG);
-        if (getBoundPipNet(uh) == nullptr)
+        bool pip_unbound = (getBoundPipNet(uh) == nullptr);
+        if (pip_unbound)
             bindPip(uh, net, STRENGTH_STRONG);
+        backtrace_has_more_hops = (backtrace.count(dest) != 0);
     }
     return true;
 }
